@@ -14,12 +14,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "change-this-secret-key";
 
+const jobs = new Map();
+
 app.use(express.json({ limit: "5mb" }));
 
 app.use(
   "/downloads",
   express.static(path.join(process.cwd(), "output"))
 );
+
+function log(jobId, message) {
+  console.log(`[${new Date().toISOString()}] [${jobId}] ${message}`);
+}
 
 function requireApiKey(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -88,6 +94,17 @@ function buildAbsoluteUrl(req, relativePath) {
   return `${protocol}://${host}${relativePath}`;
 }
 
+function buildAbsoluteUrlFromBase(baseUrl, relativePath) {
+  return `${baseUrl}${relativePath}`;
+}
+
+function getBaseUrl(req) {
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol;
+  const host = req.get("host");
+
+  return `${protocol}://${host}`;
+}
+
 function sanitizeNumber(value, fallback, min, max) {
   const number = Number(value);
 
@@ -134,6 +151,36 @@ function validateUrlList(urls) {
         return false;
       }
     });
+}
+
+function normalizeCaptureRequest(body = {}) {
+  const {
+    mode,
+    domain,
+    urls,
+    outputFormat = "pdf",
+    maxPages = 50,
+    maxDepth = 2,
+    includeSubdomains = false,
+    hideOverlays = true,
+    viewportWidth = 1440,
+    viewportHeight = 1200,
+    concurrency = 1
+  } = body;
+
+  return {
+    mode: normalizeMode(mode, urls),
+    domain: domain ? ensureFullUrl(domain) : "",
+    urls: validateUrlList(urls),
+    outputFormat: normalizeOutputFormat(outputFormat),
+    maxPages: sanitizeNumber(maxPages, 50, 1, 500),
+    maxDepth: sanitizeNumber(maxDepth, 2, 0, 10),
+    includeSubdomains: sanitizeBoolean(includeSubdomains, false),
+    hideOverlays: sanitizeBoolean(hideOverlays, true),
+    viewportWidth: sanitizeNumber(viewportWidth, 1440, 320, 3840),
+    viewportHeight: sanitizeNumber(viewportHeight, 1200, 320, 3000),
+    concurrency: sanitizeNumber(concurrency, 1, 1, 5)
+  };
 }
 
 async function ensureOutputFolders() {
@@ -184,13 +231,402 @@ async function createZipFromScreenshots({ screenshotResults, jobId }) {
   return zipPath;
 }
 
+function createJobRecord({ jobId, baseUrl, request }) {
+  const now = new Date().toISOString();
+
+  const job = {
+    status: "queued",
+    jobId,
+    createdAt: now,
+    updatedAt: now,
+    baseUrl,
+    request,
+    mode: request.mode,
+    target: request.mode === "entire_site" ? request.domain : "specific URLs",
+    outputFormat: request.outputFormat,
+    fileType: null,
+    fileUrl: null,
+    pagesRequested: 0,
+    pagesCaptured: 0,
+    pagesSkipped: 0,
+    currentStep: "Queued",
+    capturedUrls: [],
+    errors: [],
+    settings: {
+      maxPages: request.maxPages,
+      maxDepth: request.maxDepth,
+      includeSubdomains: request.includeSubdomains,
+      hideOverlays: request.hideOverlays,
+      viewportWidth: request.viewportWidth,
+      viewportHeight: request.viewportHeight,
+      concurrency: request.concurrency
+    }
+  };
+
+  jobs.set(jobId, job);
+
+  return job;
+}
+
+function updateJob(jobId, updates) {
+  const existing = jobs.get(jobId);
+
+  if (!existing) {
+    return null;
+  }
+
+  const updated = {
+    ...existing,
+    ...updates,
+    updatedAt: new Date().toISOString()
+  };
+
+  jobs.set(jobId, updated);
+
+  return updated;
+}
+
+function publicJobResponse(job) {
+  if (!job) {
+    return {
+      status: "error",
+      error: "Job not found."
+    };
+  }
+
+  return {
+    status: job.status,
+    jobId: job.jobId,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    mode: job.mode,
+    target: job.target,
+    outputFormat: job.outputFormat,
+    fileType: job.fileType,
+    fileUrl: job.fileUrl,
+    pagesRequested: job.pagesRequested,
+    pagesCaptured: job.pagesCaptured,
+    pagesSkipped: job.pagesSkipped,
+    currentStep: job.currentStep,
+    settings: job.settings,
+    capturedUrls: job.capturedUrls,
+    errors: job.errors
+  };
+}
+
+async function runCaptureJob(jobId) {
+  const job = jobs.get(jobId);
+
+  if (!job) {
+    return;
+  }
+
+  const request = job.request;
+
+  try {
+    log(jobId, "Job started.");
+
+    await ensureOutputFolders();
+
+    updateJob(jobId, {
+      status: "running",
+      currentStep: "Preparing URLs"
+    });
+
+    let urlsToCapture = [];
+
+    if (request.mode === "specific_urls") {
+      urlsToCapture = request.urls;
+
+      if (urlsToCapture.length === 0) {
+        throw new Error("Specific URL mode requires a non-empty urls array.");
+      }
+
+      log(jobId, `Specific URL count: ${urlsToCapture.length}`);
+    } else {
+      if (!request.domain) {
+        throw new Error("Entire site mode requires a domain.");
+      }
+
+      log(jobId, `Crawling domain: ${request.domain}`);
+
+      updateJob(jobId, {
+        currentStep: `Crawling ${request.domain}`
+      });
+
+      urlsToCapture = await crawlDomain({
+        domain: request.domain,
+        maxPages: request.maxPages,
+        maxDepth: request.maxDepth,
+        includeSubdomains: request.includeSubdomains
+      });
+
+      log(jobId, `Crawler found ${urlsToCapture.length} URL(s).`);
+    }
+
+    if (urlsToCapture.length === 0) {
+      throw new Error("No URLs found to capture.");
+    }
+
+    updateJob(jobId, {
+      pagesRequested: urlsToCapture.length,
+      currentStep: `Capturing ${urlsToCapture.length} screenshot(s)`
+    });
+
+    log(jobId, "Starting screenshots.");
+
+    const screenshotResults = await screenshotUrls({
+      urls: urlsToCapture,
+      jobId,
+      viewportWidth: request.viewportWidth,
+      viewportHeight: request.viewportHeight,
+      concurrency: request.concurrency,
+      hideFixed: request.hideOverlays
+    });
+
+    const captured = screenshotResults.filter(
+      result => result.status === "captured"
+    );
+
+    const failed = screenshotResults.filter(
+      result => result.status === "failed"
+    );
+
+    log(
+      jobId,
+      `Screenshots complete. Captured: ${captured.length}. Failed: ${failed.length}.`
+    );
+
+    if (captured.length === 0) {
+      throw new Error("No screenshots were captured successfully.");
+    }
+
+    updateJob(jobId, {
+      pagesCaptured: captured.length,
+      pagesSkipped: failed.length,
+      capturedUrls: captured.map(result => result.url),
+      errors: failed.map(result => ({
+        url: result.url,
+        error: result.error
+      })),
+      currentStep:
+        request.outputFormat === "png"
+          ? "Creating PNG ZIP"
+          : "Creating PDF"
+    });
+
+    let filePath;
+    let relativeDownloadPath;
+    let fileType;
+
+    if (request.outputFormat === "png") {
+      log(jobId, "Creating PNG ZIP.");
+
+      filePath = await createZipFromScreenshots({
+        screenshotResults,
+        jobId
+      });
+
+      relativeDownloadPath = `/downloads/zips/${path.basename(filePath)}`;
+      fileType = "zip";
+    } else {
+      log(jobId, "Creating PDF.");
+
+      filePath = await createPdfFromScreenshots({
+        screenshotResults,
+        jobId,
+        title:
+          request.mode === "entire_site"
+            ? `Screenshots for ${request.domain}`
+            : "Specific URL Screenshots"
+      });
+
+      relativeDownloadPath = `/downloads/pdfs/${path.basename(filePath)}`;
+      fileType = "pdf";
+    }
+
+    const fileUrl = buildAbsoluteUrlFromBase(job.baseUrl, relativeDownloadPath);
+
+    updateJob(jobId, {
+      status: "complete",
+      fileType,
+      fileUrl,
+      currentStep: "Complete"
+    });
+
+    log(jobId, `Job complete. File created: ${fileUrl}`);
+  } catch (error) {
+    log(jobId, `Job error: ${error.message}`);
+
+    updateJob(jobId, {
+      status: "error",
+      currentStep: "Error",
+      errors: [
+        ...(jobs.get(jobId)?.errors || []),
+        {
+          url: "",
+          error: error.message
+        }
+      ]
+    });
+  }
+}
+
+async function runCaptureImmediately({ req, jobId, request }) {
+  await ensureOutputFolders();
+
+  let urlsToCapture = [];
+  let captureTarget = "";
+
+  if (request.mode === "specific_urls") {
+    urlsToCapture = request.urls;
+
+    if (urlsToCapture.length === 0) {
+      return {
+        statusCode: 400,
+        body: {
+          status: "error",
+          jobId,
+          error: "Specific URL mode requires a non-empty urls array."
+        }
+      };
+    }
+
+    captureTarget = "specific URLs";
+  } else {
+    if (!request.domain) {
+      return {
+        statusCode: 400,
+        body: {
+          status: "error",
+          jobId,
+          error: "Entire site mode requires a domain."
+        }
+      };
+    }
+
+    captureTarget = request.domain;
+
+    urlsToCapture = await crawlDomain({
+      domain: request.domain,
+      maxPages: request.maxPages,
+      maxDepth: request.maxDepth,
+      includeSubdomains: request.includeSubdomains
+    });
+  }
+
+  if (urlsToCapture.length === 0) {
+    return {
+      statusCode: 400,
+      body: {
+        status: "error",
+        jobId,
+        error: "No URLs found to capture."
+      }
+    };
+  }
+
+  const screenshotResults = await screenshotUrls({
+    urls: urlsToCapture,
+    jobId,
+    viewportWidth: request.viewportWidth,
+    viewportHeight: request.viewportHeight,
+    concurrency: request.concurrency,
+    hideFixed: request.hideOverlays
+  });
+
+  const captured = screenshotResults.filter(
+    result => result.status === "captured"
+  );
+
+  const failed = screenshotResults.filter(
+    result => result.status === "failed"
+  );
+
+  if (captured.length === 0) {
+    return {
+      statusCode: 500,
+      body: {
+        status: "error",
+        jobId,
+        error: "No screenshots were captured successfully.",
+        pagesRequested: urlsToCapture.length,
+        pagesCaptured: 0,
+        pagesSkipped: failed.length,
+        errors: failed.map(result => ({
+          url: result.url,
+          error: result.error
+        }))
+      }
+    };
+  }
+
+  let filePath;
+  let relativeDownloadPath;
+  let fileType;
+
+  if (request.outputFormat === "png") {
+    filePath = await createZipFromScreenshots({
+      screenshotResults,
+      jobId
+    });
+
+    relativeDownloadPath = `/downloads/zips/${path.basename(filePath)}`;
+    fileType = "zip";
+  } else {
+    filePath = await createPdfFromScreenshots({
+      screenshotResults,
+      jobId,
+      title:
+        request.mode === "entire_site"
+          ? `Screenshots for ${captureTarget}`
+          : "Specific URL Screenshots"
+    });
+
+    relativeDownloadPath = `/downloads/pdfs/${path.basename(filePath)}`;
+    fileType = "pdf";
+  }
+
+  return {
+    statusCode: 200,
+    body: {
+      status: "complete",
+      jobId,
+      mode: request.mode,
+      target: captureTarget,
+      outputFormat: request.outputFormat,
+      fileType,
+      fileUrl: buildAbsoluteUrl(req, relativeDownloadPath),
+      pagesRequested: urlsToCapture.length,
+      pagesCaptured: captured.length,
+      pagesSkipped: failed.length,
+      settings: {
+        maxPages: request.maxPages,
+        maxDepth: request.maxDepth,
+        includeSubdomains: request.includeSubdomains,
+        hideOverlays: request.hideOverlays,
+        viewportWidth: request.viewportWidth,
+        viewportHeight: request.viewportHeight,
+        concurrency: request.concurrency
+      },
+      capturedUrls: captured.map(result => result.url),
+      errors: failed.map(result => ({
+        url: result.url,
+        error: result.error
+      }))
+    }
+  };
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     name: "Website Screenshot Export API",
     endpoints: {
       health: "/health",
-      capture: "/capture",
+      createJob: "POST /jobs",
+      getJob: "GET /jobs/:jobId",
+      capture: "POST /capture",
       downloads: "/downloads"
     }
   });
@@ -202,165 +638,87 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.post("/jobs", requireApiKey, async (req, res) => {
+  const jobId = `capture-${nanoid(10)}`;
+
+  try {
+    const request = normalizeCaptureRequest(req.body || {});
+    const baseUrl = getBaseUrl(req);
+
+    const job = createJobRecord({
+      jobId,
+      baseUrl,
+      request
+    });
+
+    log(jobId, "Queued async job.");
+
+    res.status(202).json({
+      status: "queued",
+      jobId,
+      message: "Screenshot job has been queued. Check job status using GET /jobs/{jobId}.",
+      statusUrl: `${baseUrl}/jobs/${jobId}`,
+      currentStep: job.currentStep
+    });
+
+    setImmediate(() => {
+      runCaptureJob(jobId).catch(error => {
+        log(jobId, `Unexpected async job error: ${error.message}`);
+
+        updateJob(jobId, {
+          status: "error",
+          currentStep: "Error",
+          errors: [
+            {
+              url: "",
+              error: error.message
+            }
+          ]
+        });
+      });
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      jobId,
+      error: error.message
+    });
+  }
+});
+
+app.get("/jobs/:jobId", requireApiKey, (req, res) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({
+      status: "error",
+      error: "Job not found."
+    });
+  }
+
+  res.json(publicJobResponse(job));
+});
+
 app.post("/capture", requireApiKey, async (req, res) => {
   const jobId = `capture-${nanoid(10)}`;
 
   try {
-    await ensureOutputFolders();
+    log(jobId, "Synchronous request received.");
 
-    const {
-      mode,
-      domain,
-      urls,
-      outputFormat = "pdf",
-      maxPages = 50,
-      maxDepth = 2,
-      includeSubdomains = false,
-      hideOverlays = true,
-      viewportWidth = 1440,
-      viewportHeight = 1200,
-      concurrency = 2
-    } = req.body || {};
+    const request = normalizeCaptureRequest(req.body || {});
 
-    const finalMode = normalizeMode(mode, urls);
-    const finalOutputFormat = normalizeOutputFormat(outputFormat);
-
-    const safeMaxPages = sanitizeNumber(maxPages, 50, 1, 500);
-    const safeMaxDepth = sanitizeNumber(maxDepth, 2, 0, 10);
-    const safeViewportWidth = sanitizeNumber(viewportWidth, 1440, 320, 3840);
-    const safeViewportHeight = sanitizeNumber(viewportHeight, 1200, 320, 3000);
-    const safeConcurrency = sanitizeNumber(concurrency, 2, 1, 5);
-    const safeIncludeSubdomains = sanitizeBoolean(includeSubdomains, false);
-    const safeHideOverlays = sanitizeBoolean(hideOverlays, true);
-
-    let urlsToCapture = [];
-    let captureTarget = "";
-
-    if (finalMode === "specific_urls") {
-      urlsToCapture = validateUrlList(urls);
-
-      if (urlsToCapture.length === 0) {
-        return res.status(400).json({
-          status: "error",
-          jobId,
-          error: "Specific URL mode requires a non-empty urls array."
-        });
-      }
-
-      captureTarget = "specific URLs";
-    } else {
-      if (!domain) {
-        return res.status(400).json({
-          status: "error",
-          jobId,
-          error: "Entire site mode requires a domain."
-        });
-      }
-
-      const finalDomain = ensureFullUrl(domain);
-      captureTarget = finalDomain;
-
-      urlsToCapture = await crawlDomain({
-        domain: finalDomain,
-        maxPages: safeMaxPages,
-        maxDepth: safeMaxDepth,
-        includeSubdomains: safeIncludeSubdomains
-      });
-    }
-
-    if (urlsToCapture.length === 0) {
-      return res.status(400).json({
-        status: "error",
-        jobId,
-        error: "No URLs found to capture."
-      });
-    }
-
-    const screenshotResults = await screenshotUrls({
-      urls: urlsToCapture,
+    const result = await runCaptureImmediately({
+      req,
       jobId,
-      viewportWidth: safeViewportWidth,
-      viewportHeight: safeViewportHeight,
-      concurrency: safeConcurrency,
-      hideFixed: safeHideOverlays
+      request
     });
 
-    const captured = screenshotResults.filter(
-      result => result.status === "captured"
-    );
+    res.status(result.statusCode).json(result.body);
 
-    const failed = screenshotResults.filter(
-      result => result.status === "failed"
-    );
-
-    if (captured.length === 0) {
-      return res.status(500).json({
-        status: "error",
-        jobId,
-        error: "No screenshots were captured successfully.",
-        pagesRequested: urlsToCapture.length,
-        pagesCaptured: 0,
-        pagesSkipped: failed.length,
-        errors: failed.map(result => ({
-          url: result.url,
-          error: result.error
-        }))
-      });
-    }
-
-    let filePath;
-    let relativeDownloadPath;
-    let fileType;
-
-    if (finalOutputFormat === "png") {
-      filePath = await createZipFromScreenshots({
-        screenshotResults,
-        jobId
-      });
-
-      relativeDownloadPath = `/downloads/zips/${path.basename(filePath)}`;
-      fileType = "zip";
-    } else {
-      filePath = await createPdfFromScreenshots({
-        screenshotResults,
-        jobId,
-        title:
-          finalMode === "entire_site"
-            ? `Screenshots for ${captureTarget}`
-            : "Specific URL Screenshots"
-      });
-
-      relativeDownloadPath = `/downloads/pdfs/${path.basename(filePath)}`;
-      fileType = "pdf";
-    }
-
-    res.json({
-      status: "complete",
-      jobId,
-      mode: finalMode,
-      target: captureTarget,
-      outputFormat: finalOutputFormat,
-      fileType,
-      fileUrl: buildAbsoluteUrl(req, relativeDownloadPath),
-      pagesRequested: urlsToCapture.length,
-      pagesCaptured: captured.length,
-      pagesSkipped: failed.length,
-      settings: {
-        maxPages: safeMaxPages,
-        maxDepth: safeMaxDepth,
-        includeSubdomains: safeIncludeSubdomains,
-        hideOverlays: safeHideOverlays,
-        viewportWidth: safeViewportWidth,
-        viewportHeight: safeViewportHeight,
-        concurrency: safeConcurrency
-      },
-      capturedUrls: captured.map(result => result.url),
-      errors: failed.map(result => ({
-        url: result.url,
-        error: result.error
-      }))
-    });
+    log(jobId, "Synchronous response sent.");
   } catch (error) {
+    log(jobId, `Synchronous error: ${error.message}`);
+
     res.status(500).json({
       status: "error",
       jobId,
