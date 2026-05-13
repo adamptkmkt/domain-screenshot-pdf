@@ -1,0 +1,23 @@
+{
+  "name": "domain-screenshot-pdf",
+  "version": "1.0.0",
+  "description": "Public API for capturing full-page website screenshots and exporting PNG ZIPs or PDFs.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "express": "^4.21.2",
+    "nanoid": "^3.3.12",
+    "pdf-lib": "^1.17.1",
+    "playwright": "^1.49.1",
+    "sharp": "^0.33.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
