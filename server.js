@@ -656,12 +656,17 @@ app.post("/jobs", requireApiKey, async (req, res) => {
     res.status(202).json({
       status: "queued",
       jobId,
-      message: "Screenshot job has been queued. Check job status using GET /jobs/{jobId}.",
+      message:
+        "Screenshot job has been queued. Ask to check this job status in a few moments.",
       statusUrl: `${baseUrl}/jobs/${jobId}`,
       currentStep: job.currentStep
     });
 
-    setImmediate(() => {
+    /*
+      Delay the heavy Playwright work so GPT Actions can receive and process
+      the queued response before Render starts using CPU for browser work.
+    */
+    setTimeout(() => {
       runCaptureJob(jobId).catch(error => {
         log(jobId, `Unexpected async job error: ${error.message}`);
 
@@ -676,7 +681,7 @@ app.post("/jobs", requireApiKey, async (req, res) => {
           ]
         });
       });
-    });
+    }, 5000);
   } catch (error) {
     res.status(500).json({
       status: "error",
